@@ -7,11 +7,13 @@ import random
 import threading
 from pathlib import Path
 
+import psycopg
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 import migrator
+import gaps
 from db import connect, ensure_meta_tables, log, logs_since
 from migrator import (
     AlreadyDone,
@@ -20,6 +22,13 @@ from migrator import (
     next_month,
     parse_month,
     start_migration,
+)
+from gaps import (
+    WatermarkError,
+    advance_watermark,
+    list_stations,
+    query_station_month,
+    station_month_summary,
 )
 
 app = FastAPI(title="观测数据月分区在线迁移")
@@ -36,6 +45,123 @@ def _startup():
 @app.get("/", response_class=FileResponse)
 def index():
     return STATIC / "index.html"
+
+
+@app.get("/gaps", response_class=FileResponse)
+def gaps_page():
+    """站月缺测催补网页。"""
+    return STATIC / "gaps.html"
+
+
+# ------------------------------------------------------------- 站月缺测催补
+@app.get("/api/gaps/stations")
+def api_gap_stations():
+    return {"stations": list_stations()}
+
+
+class WatermarkReq(BaseModel):
+    station_id: str
+    month: str
+    target_ts: str  # UTC 整点 ISO 8601，如 2026-11-03T08:00Z
+
+
+@app.post("/api/gaps/watermark")
+def api_advance_watermark(req: WatermarkReq):
+    try:
+        return advance_watermark(req.station_id, req.month, req.target_ts)
+    except WatermarkError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/gaps")
+def api_gaps(station_id: str, month: str):
+    try:
+        return query_station_month(station_id, month)
+    except WatermarkError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/gaps/summary")
+def api_gaps_summary(month: str):
+    m = parse_month(month)
+    return {"month": month, "stations": station_month_summary(m)}
+
+
+class CollectReq(BaseModel):
+    """采集端独立 SQL 写入（每次新建连接、独立事务）。"""
+    op: str                       # insert / upsert / update_ts / delete
+    station_id: str
+    ts: str                       # ISO 8601；非整点也允许，用于验证不抵数
+    value: int | None = None
+    new_ts: str | None = None     # update_ts：改写到的新时刻
+
+
+def _collect_write(op: str, station: str, ts_str: str,
+                   value: int | None, new_ts_str: str | None) -> dict:
+    """模拟采集端：独立连接、直接 SQL，随事务由触发器维护缺口清单。"""
+    with connect() as conn:  # 独立连接，自动提交；失败即回滚，清单不变
+        if op == "insert":
+            row = conn.execute(
+                "INSERT INTO observations (station_id, ts, value)"
+                " VALUES (%s, %s::timestamptz, %s)"
+                " RETURNING station_id, ts, value",
+                (station, ts_str, value if value is not None else 0),
+            ).fetchone()
+            return {"op": op, "station_id": row[0], "ts": row[1].isoformat(),
+                    "value": row[2]}
+        if op == "upsert":
+            row = conn.execute(
+                "INSERT INTO observations (station_id, ts, value)"
+                " VALUES (%s, %s::timestamptz, %s)"
+                " ON CONFLICT (station_id, ts) DO UPDATE SET value = EXCLUDED.value"
+                " RETURNING station_id, ts, value",
+                (station, ts_str, value if value is not None else 0),
+            ).fetchone()
+            return {"op": op, "station_id": row[0], "ts": row[1].isoformat(),
+                    "value": row[2]}
+        if op == "update_ts":
+            if not new_ts_str:
+                raise HTTPException(status_code=400, detail="update_ts 需要 new_ts")
+            row = conn.execute(
+                "UPDATE observations SET ts = %s::timestamptz"
+                " WHERE station_id = %s AND ts = %s::timestamptz"
+                " RETURNING station_id, ts, value",
+                (new_ts_str, station, ts_str),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404,
+                                    detail=f"未找到 {station} @ {ts_str}")
+            return {"op": op, "station_id": row[0], "ts": row[1].isoformat(),
+                    "value": row[2]}
+        if op == "delete":
+            row = conn.execute(
+                "DELETE FROM observations WHERE station_id = %s AND ts = %s::timestamptz"
+                " RETURNING station_id, ts, value",
+                (station, ts_str),
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404,
+                                    detail=f"未找到 {station} @ {ts_str}")
+            return {"op": op, "station_id": row[0], "ts": row[1].isoformat(),
+                    "old_value": row[2]}
+    raise HTTPException(status_code=400, detail=f"未知操作: {op}")
+
+
+@app.post("/api/gaps/collect")
+def api_collect(req: CollectReq):
+    if req.op not in ("insert", "upsert", "update_ts", "delete"):
+        raise HTTPException(status_code=400, detail=f"未知操作: {req.op}")
+    try:
+        result = _collect_write(req.op, req.station_id, req.ts,
+                                req.value, req.new_ts)
+    except WatermarkError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except psycopg.Error as e:
+        # 独立事务已回滚，缺口清单不会被半次写入改变
+        raise HTTPException(status_code=409,
+                            detail=f"采集写入失败（事务回滚，清单不变）：{e.diag.message_primary or e}")
+    log(f"[采集端] {result}")
+    return result
 
 
 # --------------------------------------------------------------------- 状态

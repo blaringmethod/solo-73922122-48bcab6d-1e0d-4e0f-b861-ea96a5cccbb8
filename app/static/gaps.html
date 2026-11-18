@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>站月缺测催补 · 水位与持久缺口清单</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --bg:#0f1420; --card:#1a2233; --line:#2a3550; --fg:#e6ebf5; --dim:#8b96ad;
+          --ok:#3fb970; --warn:#e0a93e; --bad:#e05e5e; --acc:#4f8cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 "PingFang SC","Microsoft YaHei",system-ui,sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; color:var(--dim); font-size:12px; }
+  header a { color:var(--acc); font-size:12px; }
+  main { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px 24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px; }
+  .card h2 { margin:0 0 10px; font-size:15px; }
+  .wide { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { padding:6px 8px; border-bottom:1px solid var(--line); text-align:left;
+          white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px;
+           padding:6px 12px; cursor:pointer; font-size:13px; }
+  button:disabled { background:#3a4566; cursor:not-allowed; }
+  button.ghost { background:#2a3550; }
+  button.warn { background:#9a6a25; }
+  button.danger { background:#8a3a3a; }
+  input,select { background:#0f1420; color:var(--fg); border:1px solid var(--line);
+                 border-radius:6px; padding:5px 8px; font-size:13px; }
+  label { color:var(--dim); font-size:12px; margin-right:4px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  .tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .tag.gap { background:#4a2626; color:var(--bad); }
+  .tag.ok  { background:#1d4030; color:var(--ok); }
+  #log { height:160px; overflow:auto; background:#0b0f18; border:1px solid var(--line);
+         border-radius:6px; padding:8px; font:12px/1.6 ui-monospace,Consolas,monospace;
+         white-space:pre-wrap; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .dim { color:var(--dim); }
+  .mono { font-family:ui-monospace,Consolas,monospace; }
+  .scroll { max-height:340px; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>站月缺测催补 · 催补水位与持久缺口清单</h1>
+  <p>选择站号与 UTC 月份，把催补水位推进到该月某个整点（只进不退）；月初到水位之间缺少
+     <b>同站同刻整点观测</b>的时刻进入持久缺口清单，非整点记录不抵数。
+     采集端独立 SQL 的迟到插入随事务消警，删除/改时刻会重开原缺口。
+     <a href="/">← 返回月分区迁移页</a></p>
+</header>
+<main>
+  <!-- 选择与水位 -->
+  <section class="card">
+    <h2>① 站月水位推进</h2>
+    <div class="row">
+      <label>站号</label><select id="station"></select>
+      <label>UTC月份</label><input id="month" type="month" style="width:150px">
+      <button class="ghost" onclick="loadGap()">查询</button>
+      <label><input type="checkbox" id="autoRefresh" checked> 自动刷新</label>
+    </div>
+    <div class="row">
+      <label>推进到整点</label>
+      <input id="targetTs" type="datetime-local" step="3600" style="width:200px">
+      <span class="dim">（按 UTC 解释）</span>
+      <button onclick="advance()">推进水位</button>
+    </div>
+    <div id="wmInfo" class="mono" style="font-size:13px;margin:6px 0">—</div>
+  </section>
+
+  <!-- 采集端写入 -->
+  <section class="card">
+    <h2>② 采集端独立 SQL 写入（独立连接/独立事务）</h2>
+    <div class="row">
+      <label>操作</label>
+      <select id="cOp">
+        <option value="insert">insert（整点可消警）</option>
+        <option value="upsert">upsert（冲突改值）</option>
+        <option value="update_ts">update 改时刻（重开旧刻缺口）</option>
+        <option value="delete">delete（水位内重开缺口）</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>站号</label><input id="cStation" style="width:90px" value="ST001">
+      <label>时刻(UTC)</label><input id="cTs" style="width:200px" placeholder="2026-11-03T08:00Z">
+      <label>测值</label><input id="cValue" type="number" style="width:80px" value="55">
+    </div>
+    <div class="row" id="newTsRow" style="display:none">
+      <label>新时刻(UTC)</label><input id="cNewTs" style="width:200px" placeholder="2026-11-03T09:30Z">
+    </div>
+    <div class="row">
+      <button class="warn" onclick="collectWrite()">提交写入</button>
+      <span class="dim">非整点时刻可验证"不抵数"；写入与左侧水位并发时由按站咨询锁串行化。</span>
+    </div>
+  </section>
+
+  <!-- 缺口清单 -->
+  <section class="card wide">
+    <h2>③ 持久缺口清单（按站月索引直读，不逐次全月重算）</h2>
+    <div id="gapSummary" class="mono" style="margin:6px 0">—</div>
+    <div class="scroll">
+      <table id="gapTable">
+        <thead><tr><th>站号</th><th>缺测整点 (UTC)</th><th>入清单时间 (UTC)</th><th>状态</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section class="card wide">
+    <h2>运行日志</h2>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+let logSeq = 0;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts && Object.assign({
+    headers: {'Content-Type':'application/json'}}, opts));
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+
+function utcMonthInput(d) {
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth()+1).padStart(2,'0');
+}
+function toUtcIso(localInput) {
+  // datetime-local 按 UTC 解释：直接拼 Z
+  return localInput.length === 16 ? localInput + ':00Z' : localInput + 'Z';
+}
+
+async function init() {
+  const r = await api('/api/gaps/stations');
+  document.getElementById('station').innerHTML =
+    r.stations.map(s => `<option>${s}</option>`).join('');
+  const now = new Date();
+  document.getElementById('month').value = utcMonthInput(now);
+  document.getElementById('station').addEventListener('change', loadGap);
+  document.getElementById('month').addEventListener('change', loadGap);
+  document.getElementById('cOp').addEventListener('change', e => {
+    document.getElementById('newTsRow').style.display =
+      e.target.value === 'update_ts' ? 'flex' : 'none';
+  });
+  await loadGap();
+}
+
+async function loadGap() {
+  const station = document.getElementById('station').value;
+  const month = document.getElementById('month').value;
+  if (!station || !month) return;
+  try {
+    const r = await api(`/api/gaps?station_id=${encodeURIComponent(station)}&month=${month}`);
+    document.getElementById('wmInfo').innerHTML =
+      `站号 <b>${r.station_id}</b> · 月份 <b>${r.month}</b> · ` +
+      (r.watermark_ts
+        ? `当前水位 <b class="ok">${r.watermark_ts}</b>（更新于 ${r.updated_at}）`
+        : `水位 <span class="dim">未建立</span>`);
+    document.getElementById('gapSummary').innerHTML =
+      `缺口数：<b class="${r.gap_count ? 'bad' : 'ok'}">${r.gap_count}</b>` +
+      `（查询直接命中 station_gaps(station_id, month) 索引）`;
+    document.querySelector('#gapTable tbody').innerHTML = r.gaps.map(g =>
+      `<tr><td>${r.station_id}</td><td class="mono">${g.ts}</td>` +
+      `<td class="mono">${g.opened_at}</td>` +
+      `<td><span class="tag gap">待补传</span></td></tr>`).join('')
+      || '<tr><td colspan="4" class="dim">该站月暂无缺口</td></tr>';
+  } catch (e) {
+    document.getElementById('wmInfo').textContent = '查询失败：' + e.message;
+  }
+}
+
+async function advance() {
+  const body = {
+    station_id: document.getElementById('station').value,
+    month: document.getElementById('month').value,
+    target_ts: toUtcIso(document.getElementById('targetTs').value),
+  };
+  try {
+    const r = await api('/api/gaps/watermark',
+      {method:'POST', body: JSON.stringify(body)});
+    appendLog(`水位推进成功：${r.previous_watermark} → ${r.watermark_ts}，缺口 ${r.gap_count}`);
+  } catch (e) {
+    appendLog('水位推进失败（原水位与清单不变）：' + e.message);
+    alert('推进失败：' + e.message);
+  }
+  loadGap();
+}
+
+async function collectWrite() {
+  const op = document.getElementById('cOp').value;
+  const body = {
+    op,
+    station_id: document.getElementById('cStation').value.trim(),
+    ts: document.getElementById('cTs').value.trim(),
+    value: Number(document.getElementById('cValue').value),
+    new_ts: op === 'update_ts' ? document.getElementById('cNewTs').value.trim() : null,
+  };
+  try {
+    const r = await api('/api/gaps/collect',
+      {method:'POST', body: JSON.stringify(body)});
+    appendLog('采集写入：' + JSON.stringify(r));
+  } catch (e) {
+    appendLog('采集写入失败（事务回滚，清单不变）：' + e.message);
+    alert('写入失败：' + e.message);
+  }
+  loadGap();
+}
+
+function appendLog(msg) {
+  const el = document.getElementById('log');
+  const at = new Date().toISOString();
+  el.textContent += `[${at}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+setInterval(() => { if (document.getElementById('autoRefresh').checked) loadGap(); }, 2000);
+init();
+</script>
+</body>
+</html>

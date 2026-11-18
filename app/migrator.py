@@ -340,6 +340,9 @@ class MigrationWorker(threading.Thread):
         conn.execute("SET lock_timeout = '10s'")
         conn.execute("SET statement_timeout = '120s'")
         with conn.transaction():
+            # 0) 本事务只做"数据搬运"：关闭缺口维护触发器的写动作，
+            #    迁移绝不制造虚假缺口，也不消掉真实缺口（SET LOCAL 事务结束自动失效）
+            conn.execute("SET LOCAL app.skip_gap_maintenance = 'on'")
             # 1) 一次性锁住整棵分区树（SHARE：挡写不挡读），避免与写入方
             #    “父表→分区”的加锁顺序形成循环等待；只此一步短暂锁表
             self._log("获取 observations 树 SHARE 锁（短暂挡写）…")
